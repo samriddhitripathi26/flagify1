@@ -1,0 +1,18 @@
+<svg id="white" xmlns="http://www.w3.org/2000/svg" width="1150" height="321" viewBox="0 0 1150 321">
+  <defs>
+    <style>
+      .cls-1 {
+        fill: #fff;
+        fill-rule: evenodd;
+      }
+    </style>
+  </defs>
+  <g id="logo_mark" data-name="logo mark">
+    <path id="book3" class="cls-1" d="M102.259,122.286l167.413-94.2s-15.783,13.884-15.089,43.938c0.74,32.029,15.089,43.939,15.089,43.939L250,107,96,167.287s-3.739-10.476-3.8-18.372C92.041,129.435,102.259,122.286,102.259,122.286Z"/>
+    <path id="book2" class="cls-1" d="M66.644,183.868l182.91-66.908s-15.783,13.884-15.089,43.939c0.74,32.029,15.089,43.938,15.089,43.938L224,195,59.827,227.317s-3.184-9.656-3.242-16.82C56.427,191.016,66.644,183.868,66.644,183.868Z"/>
+    <g id="book_1" data-name="book 1">
+      <path id="book1" class="cls-1" d="M31.059,238.127l192.988-34.621s-15.783,13.884-15.089,43.938c0.74,32.029,15.089,43.939,15.089,43.939H32.5S21.168,284.5,21,263.756C20.842,244.275,31.059,238.127,31.059,238.127Z"/>
+    </g>
+  </g>
+  <text x="320" y="245" font-family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-size="205" font-weight="bold" fill="#fff" letter-spacing="-3">Flagify</text>
+</svg>

@@ -1,0 +1,668 @@
+import { TeamInterface } from "shared/types/team";
+import {
+  EnvScopedPermission,
+  GlobalPermission,
+  ExpandedMember,
+  OrganizationInterface,
+  OrganizationSettings,
+  Permission,
+  Role,
+  ProjectScopedPermission,
+  UserPermissions,
+  GetOrganizationResponse,
+  OrganizationUsage,
+} from "shared/types/organization";
+import type {
+  AccountPlan,
+  CommercialFeature,
+  LicenseInterface,
+  SubscriptionInfo,
+} from "shared/enterprise";
+import { SSOConnectionInterface } from "shared/types/sso-connection";
+import { useRouter } from "next/router";
+import {
+  createContext,
+  ReactNode,
+  useCallback,
+  useContext,
+  useEffect,
+  useMemo,
+  useState,
+} from "react";
+import {
+  setUser as sentrySetUser,
+  setTag as sentrySetTag,
+} from "@sentry/nextjs";
+import { FLAGIFY_SECURE_ATTRIBUTE_SALT } from "shared/constants";
+import {
+  Permissions,
+  roleToPermissionMap,
+  userHasPermission,
+} from "shared/permissions";
+import { getDemoDatasourceProjectIdForOrganization } from "shared/demo-datasource";
+import { getValidDate } from "shared/dates";
+import sha256 from "crypto-js/sha256";
+import { AgreementType } from "shared/validators";
+import { getOwnerDisplay as getOwnerDisplayName } from "@/services/owners";
+import {
+  getFlagifyBuild,
+  getSuperadminDefaultRole,
+  hasFileConfig,
+  isCloud,
+  isMultiOrg,
+  isSentryEnabled,
+  usingSSO,
+} from "@/services/env";
+import useApi from "@/hooks/useApi";
+import { useAuth, UserOrganizations } from "@/services/auth";
+import { getJitsuClient, trackPageView } from "@/services/track";
+import { getOrGeneratePageId, flagify } from "@/services/utils";
+
+export interface PermissionFunctions {
+  check(permission: GlobalPermission): boolean;
+  check(
+    permission: EnvScopedPermission,
+    project: string[] | string | undefined,
+    envs: string[],
+  ): boolean;
+  check(
+    permission: ProjectScopedPermission,
+    project: string[] | string | undefined,
+  ): boolean;
+}
+
+export type Team = Omit<TeamInterface, "members"> & {
+  members?: ExpandedMember[];
+};
+
+export const DEFAULT_PERMISSIONS: Record<GlobalPermission, boolean> = {
+  createDimensions: false,
+  createPresentations: false,
+  createMetricGroups: false,
+  manageApiKeys: false,
+  manageBilling: false,
+  manageNamespaces: false,
+  manageNorthStarMetric: false,
+  manageTags: false,
+  manageTeam: false,
+  manageEventWebhooks: false,
+  manageIntegrations: false,
+  organizationSettings: false,
+  superDeleteReport: false,
+  viewAuditLog: false,
+  readData: false,
+  manageCustomRoles: false,
+  manageCustomFields: false,
+  manageDecisionCriteria: false,
+};
+
+export interface UserContextValue {
+  ready?: boolean;
+  userId?: string;
+  name?: string;
+  pylonHmacHash?: string;
+  email?: string;
+  superAdmin?: boolean;
+  license?: Partial<LicenseInterface> | null;
+  installationName?: string;
+  subscription: SubscriptionInfo | null;
+  user?: ExpandedMember;
+  users: Map<string, ExpandedMember>;
+  getUserDisplay: (id: string, fallback?: boolean) => string;
+  getOwnerDisplay: (owner: string | undefined) => string;
+  updateUser: () => Promise<void>;
+  refreshOrganization: () => Promise<void>;
+  permissions: Record<GlobalPermission, boolean> & PermissionFunctions;
+  settings: OrganizationSettings;
+  enterpriseSSO?: Partial<SSOConnectionInterface> | null;
+  accountPlan?: AccountPlan;
+  effectiveAccountPlan?: AccountPlan;
+  licenseError: string;
+  commercialFeatures: CommercialFeature[];
+  organization: Partial<OrganizationInterface>;
+  agreements?: AgreementType[];
+  seatsInUse: number;
+  roles: Role[];
+  teams?: Team[];
+  error?: string;
+  hasCommercialFeature: (feature: CommercialFeature) => boolean;
+  commercialFeatureLowestPlan?: Partial<Record<CommercialFeature, AccountPlan>>;
+  permissionsUtil: Permissions;
+  watching: {
+    experiments: string[];
+    features: string[];
+  };
+  canSubscribe: boolean;
+  freeSeats: number;
+  usage?: OrganizationUsage;
+}
+
+interface UserResponse {
+  status: number;
+  userId: string;
+  userName: string;
+  email: string;
+  pylonHmacHash: string;
+  verified: boolean;
+  superAdmin: boolean;
+  organizations?: UserOrganizations;
+  currentUserPermissions: UserPermissions;
+}
+
+export const UserContext = createContext<UserContextValue>({
+  permissions: { ...DEFAULT_PERMISSIONS, check: () => false },
+  settings: {},
+  users: new Map(),
+  roles: [],
+  commercialFeatures: [],
+  getUserDisplay: () => "",
+  getOwnerDisplay: () => "",
+  updateUser: async () => {
+    // Do nothing
+  },
+  refreshOrganization: async () => {
+    // Do nothing
+  },
+  organization: {},
+  agreements: [],
+  subscription: null,
+  licenseError: "",
+  seatsInUse: 0,
+  teams: [],
+  hasCommercialFeature: () => false,
+  permissionsUtil: new Permissions({
+    global: {
+      permissions: {},
+      limitAccessByEnvironment: false,
+      environments: [],
+    },
+    projects: {},
+  }),
+  watching: {
+    experiments: [],
+    features: [],
+  },
+  canSubscribe: false,
+  freeSeats: 3,
+});
+
+export function useUser() {
+  return useContext(UserContext);
+}
+
+let currentUser: null | {
+  id: string;
+  org: string;
+  role: string;
+  effectiveAccountPlan: string;
+  orgCreationDate: string;
+} = null;
+export function getCurrentUser() {
+  return currentUser;
+}
+
+export function UserContextProvider({ children }: { children: ReactNode }) {
+  const { isAuthenticated, orgId, setOrganizations } = useAuth();
+
+  const {
+    data,
+    mutate: mutateUser,
+    error,
+  } = useApi<UserResponse>(`/user`, {
+    shouldRun: () => isAuthenticated,
+    orgScoped: false,
+  });
+
+  const updateUser = useCallback(async () => {
+    await mutateUser();
+  }, [mutateUser]);
+
+  const router = useRouter();
+
+  const {
+    data: currentOrg,
+    mutate: refreshOrganization,
+    error: orgLoadingError,
+  } = useApi<GetOrganizationResponse>(`/organization`, {
+    shouldRun: () => !!orgId,
+  });
+
+  const hashedOrganizationId = useMemo(() => {
+    const id = currentOrg?.organization?.id || "";
+    if (!id) return "";
+    return sha256(FLAGIFY_SECURE_ATTRIBUTE_SALT + id).toString();
+  }, [currentOrg?.organization?.id]);
+
+  useEffect(() => {
+    if (data?.organizations && setOrganizations) {
+      setOrganizations(data.organizations, data.superAdmin);
+    }
+  }, [data, setOrganizations]);
+
+  const users = useMemo(() => {
+    const userMap = new Map<string, ExpandedMember>();
+    const members = currentOrg?.members;
+    if (!members) return userMap;
+    members.forEach((member) => {
+      userMap.set(member.id, member);
+    });
+    return userMap;
+  }, [currentOrg?.members]);
+
+  const teams = useMemo(() => {
+    return currentOrg?.teams.map((team) => {
+      const hydratedMembers = team.members?.reduce<ExpandedMember[]>(
+        (res, member) => {
+          const user = users.get(member);
+          if (user) {
+            res.push(user);
+          }
+          return res;
+        },
+        [],
+      );
+      return { ...team, members: hydratedMembers };
+    });
+  }, [currentOrg?.teams, users]);
+
+  let user = users.get(data?.userId || "");
+  if (!user && data) {
+    user = {
+      email: data.email,
+      verified: data.verified,
+      id: data.userId,
+      environments: [],
+      limitAccessByEnvironment: false,
+      name: data.userName,
+      role: data.superAdmin ? getSuperadminDefaultRole() : "readonly",
+      projectRoles: [],
+    };
+  }
+
+  // Update current user data for telemetry data
+  useEffect(() => {
+    currentUser = {
+      org: orgId || "",
+      id: data?.userId || "",
+      role: user?.role || "",
+      effectiveAccountPlan: currentOrg?.effectiveAccountPlan ?? "",
+      orgCreationDate: currentOrg?.organization?.dateCreated
+        ? getValidDate(currentOrg.organization.dateCreated).toISOString()
+        : "",
+    };
+  }, [
+    orgId,
+    currentOrg?.effectiveAccountPlan,
+    currentOrg?.organization,
+    data?.userId,
+    user?.role,
+  ]);
+
+  // User/build Flagify attributes
+  useEffect(() => {
+    let anonymous_id = "";
+    // This is an undocumented way to get the anonymous id from Jitsu
+    // Lots of type guards added to avoid breaking if we update Jitsu in the future
+    const jitsu = getJitsuClient();
+    if (
+      jitsu &&
+      "getAnonymousId" in jitsu &&
+      typeof jitsu.getAnonymousId === "function"
+    ) {
+      const _anonymous_id = jitsu.getAnonymousId();
+      if (typeof _anonymous_id === "string") {
+        anonymous_id = _anonymous_id;
+      }
+    }
+
+    const build = getFlagifyBuild();
+
+    flagify.updateAttributes({
+      anonymous_id,
+      id: data?.userId || "",
+      user_id: data?.userId || "",
+      superAdmin: data?.superAdmin || false,
+      cloud: isCloud(),
+      multiOrg: isMultiOrg(),
+      configFile: hasFileConfig(),
+      usingSSO: usingSSO(),
+      buildSHA: build.sha,
+      buildDate: build.date,
+      buildVersion: build.lastVersion,
+      orgOwnerJobTitle:
+        currentOrg?.organization?.demographicData?.ownerJobTitle,
+      orgOwnerUsageIntents:
+        currentOrg?.organization?.demographicData?.ownerUsageIntents,
+    });
+  }, [
+    data?.superAdmin,
+    data?.userId,
+    currentOrg?.organization?.demographicData?.ownerJobTitle,
+    currentOrg?.organization?.demographicData?.ownerUsageIntents,
+  ]);
+
+  // Org Flagify attributes
+  useEffect(() => {
+    flagify.updateAttributes({
+      role: user?.role || "",
+      organizationId: hashedOrganizationId,
+      cloudOrgId: isCloud() ? currentOrg?.organization?.id || "" : "",
+      orgDateCreated: currentOrg?.organization?.dateCreated
+        ? getValidDate(currentOrg.organization.dateCreated).toISOString()
+        : "",
+      accountPlan: currentOrg?.effectiveAccountPlan || "loading",
+      hasLicenseKey: !!currentOrg?.organization?.licenseKey,
+      freeSeats: currentOrg?.organization?.freeSeats || 3,
+      discountCode: currentOrg?.organization?.discountCode || "",
+      isVercelIntegration: !!currentOrg?.organization?.isVercelIntegration,
+    });
+  }, [currentOrg, hashedOrganizationId, user?.role]);
+
+  // Page Flagify attributes
+  useEffect(() => {
+    flagify.setURL(window.location.href);
+    flagify.updateAttributes({
+      url: router?.pathname || "",
+      page_id: getOrGeneratePageId(),
+    });
+  }, [router?.pathname]);
+
+  // Track logged-in page views
+  useEffect(() => {
+    if (!currentOrg?.organization?.id) return;
+    trackPageView(router.pathname);
+  }, [router?.pathname, currentOrg?.organization?.id]);
+
+  useEffect(() => {
+    if (!data?.email) return;
+
+    // Error tracking only enabled on Flagify Cloud
+    if (isSentryEnabled()) {
+      sentrySetUser({ email: data.email, id: data.userId });
+    }
+  }, [data?.email, data?.userId]);
+
+  useEffect(() => {
+    // Error tracking only enabled on Flagify Cloud
+    const orgId = currentOrg?.organization?.id;
+    if (isSentryEnabled() && orgId) {
+      sentrySetTag("organization", orgId);
+    }
+  }, [currentOrg?.organization?.id]);
+
+  const commercialFeatures = useMemo(() => {
+    return new Set(currentOrg?.commercialFeatures || []);
+  }, [currentOrg?.commercialFeatures]);
+
+  const permissionsCheck = useCallback(
+    (
+      permission: Permission,
+      project?: string[] | string,
+      envs?: string[],
+    ): boolean => {
+      if (!currentOrg?.currentUserPermissions || !currentOrg || !data?.userId)
+        return false;
+
+      return userHasPermission(
+        currentOrg.currentUserPermissions,
+        permission,
+        project,
+        envs ? [...envs] : undefined,
+      );
+    },
+    [currentOrg, data?.userId],
+  );
+
+  const permissions = useMemo(() => {
+    // Build out permissions object for backwards-compatible `permissions.manageTeams` style usage
+    const permissions: Record<GlobalPermission, boolean> = {
+      ...DEFAULT_PERMISSIONS,
+    };
+
+    for (const permission in permissions) {
+      permissions[permission] =
+        currentOrg?.currentUserPermissions?.global.permissions[permission] ||
+        false;
+    }
+
+    return {
+      ...permissions,
+      check: permissionsCheck,
+    };
+  }, [
+    currentOrg?.currentUserPermissions?.global.permissions,
+    permissionsCheck,
+  ]);
+
+  const permissionsUtil = useMemo(() => {
+    const basePermissions: UserPermissions =
+      currentOrg?.currentUserPermissions || {
+        global: {
+          permissions: {},
+          limitAccessByEnvironment: false,
+          environments: [],
+        },
+        projects: {},
+      };
+
+    // Inject a project-scoped role for the sample data project. The
+    // permissions system already supports per-project role overrides, so this
+    // gives us the existing readonly UX everywhere with no per-page tweaks.
+    //
+    // We start from readonly, then grant just the permissions needed to
+    // explore the sample data — running queries plus updating features,
+    // experiments, and fact metrics. We then patch the create/delete entry
+    // points below to keep new-resource CTAs disabled (the underlying
+    // permission can't separate update from create/delete).
+    const orgId = currentOrg?.organization?.id;
+    const org = currentOrg?.organization;
+    if (orgId && org) {
+      const demoProjectId = getDemoDatasourceProjectIdForOrganization(orgId);
+      const permissions = new Permissions({
+        ...basePermissions,
+        projects: {
+          ...basePermissions.projects,
+          [demoProjectId]: {
+            permissions: {
+              ...roleToPermissionMap("readonly", org),
+              runQueries: true,
+              // Allow editing existing features/experiments/fact metrics.
+              manageFeatures: true,
+              manageFeatureDrafts: true,
+              canReview: true,
+              createAnalyses: true,
+              manageFactMetrics: true,
+              // Allow publishing the resulting changes.
+              publishFeatures: true,
+              runExperiments: true,
+            },
+            limitAccessByEnvironment: false,
+            environments: [],
+          },
+        },
+      });
+
+      // Block create/delete on the demo project — the granted permissions above
+      // gate update + create + delete equally, so we patch the create/delete
+      // call sites to keep "Add ..." CTAs disabled across the app.
+      const targetsDemoProject = (project?: string) =>
+        project === demoProjectId;
+      const projectsTargetDemoOnly = (projects?: string[]) =>
+        !!projects?.length && projects.every((p) => p === demoProjectId);
+
+      const wrapByProject =
+        <T extends { project?: string }, R extends boolean>(
+          original: (arg: T) => R,
+        ) =>
+        (arg: T) =>
+          (targetsDemoProject(arg.project) ? false : original(arg)) as R;
+
+      const wrapByProjects =
+        <T extends { projects?: string[] }, R extends boolean>(
+          original: (arg: T) => R,
+        ) =>
+        (arg: T) =>
+          (projectsTargetDemoOnly(arg.projects) ? false : original(arg)) as R;
+
+      const wrapByProjectString =
+        (
+          original: (
+            project?: string,
+            allProjects?: { id: string }[],
+          ) => boolean,
+        ) =>
+        (project?: string, allProjects?: { id: string }[]) =>
+          targetsDemoProject(project) ? false : original(project, allProjects);
+
+      permissions.canCreateFeature = wrapByProject(
+        permissions.canCreateFeature,
+      );
+      permissions.canDeleteFeature = wrapByProject(
+        permissions.canDeleteFeature,
+      );
+      permissions.canViewFeatureModal = wrapByProjectString(
+        permissions.canViewFeatureModal,
+      );
+
+      permissions.canCreateExperiment = wrapByProject(
+        permissions.canCreateExperiment,
+      );
+      permissions.canDeleteExperiment = wrapByProject(
+        permissions.canDeleteExperiment,
+      );
+      permissions.canViewExperimentModal = wrapByProjectString(
+        permissions.canViewExperimentModal,
+      );
+      permissions.canCreateExperimentTemplate = wrapByProject(
+        permissions.canCreateExperimentTemplate,
+      );
+      permissions.canDeleteExperimentTemplate = wrapByProject(
+        permissions.canDeleteExperimentTemplate,
+      );
+      permissions.canViewExperimentTemplateModal = wrapByProjectString(
+        permissions.canViewExperimentTemplateModal,
+      );
+
+      permissions.canCreateFactMetric = wrapByProjects(
+        permissions.canCreateFactMetric,
+      );
+      permissions.canDeleteFactMetric = wrapByProjects(
+        permissions.canDeleteFactMetric,
+      );
+
+      permissions.canCreateHoldout = wrapByProjects(
+        permissions.canCreateHoldout,
+      );
+      permissions.canDeleteHoldout = wrapByProjects(
+        permissions.canDeleteHoldout,
+      );
+      permissions.canViewHoldoutModal = wrapByProjectString(
+        permissions.canViewHoldoutModal,
+      );
+
+      return permissions;
+    }
+    return new Permissions(basePermissions);
+  }, [currentOrg?.currentUserPermissions, currentOrg?.organization]);
+
+  const getUserDisplay = useCallback(
+    (id: string, fallback = true) => {
+      const u = users.get(id);
+      if (!u && fallback) return id;
+      return u?.name || u?.email || "";
+    },
+    [users],
+  );
+
+  const getOwnerDisplay = useCallback(
+    (owner: string | undefined) => {
+      return getOwnerDisplayName({ owner, users });
+    },
+    [users],
+  );
+
+  const watching = useMemo(() => {
+    return {
+      experiments: currentOrg?.watching?.experiments || [],
+      features: currentOrg?.watching?.features || [],
+    };
+  }, [currentOrg]);
+
+  const [ready, setReady] = useState(false);
+  useEffect(() => {
+    if (data) setReady(true);
+  }, [data]);
+
+  const organization: Partial<OrganizationInterface> | undefined =
+    currentOrg?.organization;
+  const subscription = currentOrg?.subscription || null;
+  const license = currentOrg?.license;
+
+  const canSubscribe = useMemo(() => {
+    const disableSelfServeBilling =
+      organization?.disableSelfServeBilling || false;
+
+    if (disableSelfServeBilling) return false;
+
+    if (organization?.enterprise) return false; //TODO: Remove this once we have moved the license off the organization
+
+    if (license?.plan === "enterprise") return false;
+
+    // if already on pro, they must have a subscription - some self-hosted pro have an annual contract not directly through stripe.
+    if (
+      license &&
+      ["pro", "pro_sso"].includes(license.plan || "") &&
+      !subscription?.externalId
+    )
+      return false;
+
+    if (["active", "trialing", "past_due"].includes(subscription?.status || ""))
+      return false;
+
+    return true;
+  }, [organization, license, subscription]);
+
+  return (
+    <UserContext.Provider
+      value={{
+        ready: ready,
+        userId: data?.userId,
+        name: data?.userName,
+        email: data?.email,
+        pylonHmacHash: data?.pylonHmacHash,
+        superAdmin: data?.superAdmin,
+        updateUser,
+        user,
+        users,
+        getUserDisplay: getUserDisplay,
+        getOwnerDisplay: getOwnerDisplay,
+        refreshOrganization: refreshOrganization as () => Promise<void>,
+        roles: currentOrg?.roles || [],
+        permissions,
+        permissionsUtil,
+        settings: currentOrg?.organization?.settings || {},
+        license,
+        installationName: currentOrg?.installationName || undefined,
+        subscription,
+        enterpriseSSO: currentOrg?.enterpriseSSO || undefined,
+        accountPlan: currentOrg?.accountPlan,
+        effectiveAccountPlan: currentOrg?.effectiveAccountPlan,
+        commercialFeatureLowestPlan: currentOrg?.commercialFeatureLowestPlan,
+        licenseError: currentOrg?.licenseError || "",
+        commercialFeatures: currentOrg?.commercialFeatures || [],
+        agreements: currentOrg?.agreements || [],
+        organization: organization || {},
+        seatsInUse: currentOrg?.seatsInUse || 0,
+        teams,
+        error: error?.message || orgLoadingError?.message,
+        hasCommercialFeature: (feature) => commercialFeatures.has(feature),
+        watching: watching,
+        canSubscribe,
+        freeSeats: organization?.freeSeats || 3,
+        usage: currentOrg?.usage,
+      }}
+    >
+      {children}
+    </UserContext.Provider>
+  );
+}

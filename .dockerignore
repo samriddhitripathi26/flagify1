@@ -1,0 +1,36 @@
+# Build and test artifacts
+.git
+.github
+.gitignore
+Dockerfile
+docker-compose.yml
+.dockerignore
+.eslint*
+.prettier*
+.husky
+*.md
+**/node_modules
+**/coverage
+**/.next
+**/dist
+**/*.log
+**/dummy
+
+# Docs
+./docs
+
+# Secrets / private data
+**/*.env.local
+**/config.yml
+packages/back-end/uploads
+
+# Python notebooks and caches
+packages/stats/**/.pytest_cache
+packages/stats/**/__pycache__
+
+# Test directories
+packages/back-end/test
+packages/front-end/test
+
+# Unneeded dev requirements that get caught in security scans
+packages/stats/dev-requirements.txt
